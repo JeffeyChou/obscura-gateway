@@ -1,0 +1,28 @@
+[Unit]
+Description=Obscura Gateway (isolated headless browsers over MCP)
+Documentation=https://github.com/obscura-gateway/obscura-gateway
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=obscura-gw
+Group=obscura-gw
+SupplementaryGroups=docker
+Environment=OBSCURA_GW_ENV_FILE=/etc/obscura-gateway/gateway.env
+ExecStart=/usr/bin/python3 /opt/obscura-gateway/gateway.py
+Restart=always
+RestartSec=3
+# remove browser containers when the gateway stops
+ExecStopPost=/bin/sh -c 'docker ps -aq --filter label=obscura-gw=1 | xargs -r docker rm -f'
+# hardening (the gateway only needs the Docker socket, its config and its state dir)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/obscura-gateway
+ReadOnlyPaths=/etc/obscura-gateway
+
+[Install]
+WantedBy=multi-user.target

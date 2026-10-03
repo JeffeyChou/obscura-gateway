@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# obscura-gw : manage an Obscura Gateway (systemd or Docker install)
+# Tokens are hot-reloaded by the gateway: add/revoke/rename need no restart.
+# MIT License
+set -euo pipefail
+ENVF=${OBSCURA_GW_ENV_FILE:-/etc/obscura-gateway/gateway.env}
+SERVICE=${OBSCURA_GW_SERVICE:-obscura-gateway}
+in_container(){ [ -f /.dockerenv ]; }
+conf(){  # conf KEY DEFAULT : value from the environment, else the env file, else default
+  local v="${!1:-}"
+  [ -n "$v" ] || v=$(grep -E "^$1=" "$ENVF" 2>/dev/null | tail -1 | cut -d= -f2- | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//' || true)
+  echo "${v:-$2}"
+}
+[ -r "$ENVF" ] || { [ "${1:-}" = "help" ] || [ "${1:-}" = "-h" ] || { echo "cannot read $ENVF (run with sudo, or set OBSCURA_GW_ENV_FILE)" >&2; exit 1; }; }
+usage(){ cat <<U
+obscura-gw <command>
+  status                 service state + health + live session count
+  sessions               list running per-agent browser containers (the pool)
+  logs [-f]              gateway logs (add -f to follow)
+  add-token <name> [-q]  create a token (per machine or per agent), print copy-paste setup
+                         commands (-q: print only the token)
+  setup <name>           print the setup commands again for an existing token
+  revoke-token <agent>   delete <agent>'s token and close its browser sessions
+  rename-token <old> <new>  relabel a token (unnamed ones show as tok-xxxxxxxx)
+  tokens                 list agents with masked tokens
+  crashes [N]            list the N (default 10) most recent backend crash logs
+  crashes show [FILE]    print one crash log (default: the newest)
+  restart | stop | start
+U
+}
+gw_host(){ h=$(conf OBSCURA_GW_HOST 127.0.0.1); [ "$h" = 0.0.0.0 ] && h=127.0.0.1; echo "$h"; }
+gw_port(){ conf OBSCURA_GW_PORT 8080; }
+crash_dir(){ conf OBSCURA_GW_CRASH_DIR "$(dirname "$(readlink -f "$0")")/crashes"; }
+label(){ conf OBSCURA_GW_LABEL obscura-gw; }
+newtoken(){ python3 -c 'import secrets;print(secrets.token_hex(24))' 2>/dev/null || openssl rand -hex 24; }
+http_get(){ python3 - "$1" <<'PY' 2>/dev/null || echo "(unreachable)"
+import sys, urllib.request
+print(urllib.request.urlopen(sys.argv[1], timeout=5).read().decode())
+PY
+}
+cur_tokens(){ grep -E '^OBSCURA_GW_TOKENS=' "$ENVF" | cut -d= -f2- || true; }
+# print "token agent" per line; unnamed tokens get the gateway's tok-<sha256[:8]> label
+token_lines(){
+  cur_tokens | tr ',' '\n' | while IFS= read -r e; do
+    [ -n "$e" ] || continue
+    t=${e%%:*}; a=""; [ "$e" != "$t" ] && a=${e#*:}
+    [ -n "$a" ] || a="tok-$(printf %s "$t" | sha256sum | cut -c1-8)"
+    printf '%s %s\n' "$t" "$a"
+  done
+}
+write_tokens(){  # stdin: "token agent" lines
+  new=$(awk 'NF==2{printf "%s%s:%s", (n++?",":""), $1, $2}')
+  [ -n "$new" ] || echo "note: no tokens left; the gateway now rejects every request" >&2
+  tmp=$(mktemp "$(dirname "$ENVF")/.gw.XXXXXX")
+  grep -v -E '^OBSCURA_GW_TOKENS=' "$ENVF" > "$tmp" || true
+  echo "OBSCURA_GW_TOKENS=$new" >> "$tmp"
+  chmod 640 "$tmp"
+  chown "$(stat -c %u:%g "$ENVF")" "$tmp" 2>/dev/null || true   # keep the gateway user's ownership
+  mv -f "$tmp" "$ENVF"   # atomic swap; gateway reloads on mtime change
+}
+public_base(){
+  b=$(conf OBSCURA_GW_PUBLIC_BASE "")
+  if [ -z "$b" ]; then
+    b="http://$(gw_host):$(gw_port)"
+    echo "note: OBSCURA_GW_PUBLIC_BASE is not set in $ENVF; using $b (only reachable from this host)" >&2
+  fi
+  echo "${b%/}"
+}
+token_of(){ token_lines | awk -v a="$1" '$2==a{print $1; exit}'; }
+print_setup(){  # $1 name, $2 token
+  B=$(public_base); U="$B/mcp"; T=$2
+  cat <<EOS
+
+Token for '$1' (keep it secret; reprint with: obscura-gw setup $1)
+  $T
+
+━━ 1. One command: run on the client machine (configures Claude Code, Codex, Pi if installed) ━━
+curl -fsSL $B/setup.sh | sh -s -- $T
+
+   only some CLIs:  curl -fsSL $B/setup.sh | sh -s -- $T claude codex
+
+━━ 2. Or per CLI ━━
+# Claude Code (all projects)
+claude mcp add --scope user --transport http obscura-remote $U -H "Authorization: Bearer $T"
+
+# Codex (token via env var; use ~/.bashrc instead of ~/.zshrc on bash)
+codex mcp add obscura-remote --url $U --bearer-token-env-var OBSCURA_REMOTE_TOKEN
+echo 'export OBSCURA_REMOTE_TOKEN=$T' >> ~/.zshrc
+
+# Pi (pi-mcp-adapter reads ~/.config/mcp/mcp.json; this overwrites that file)
+mkdir -p ~/.config/mcp && umask 077 && cat > ~/.config/mcp/mcp.json <<'JSON'
+{"mcpServers":{"obscura-remote":{"url":"$U","auth":"bearer","bearerToken":"$T","directTools":true}}}
+JSON
+
+━━ 3. Any other MCP client ━━
+  Transport : Streamable HTTP
+  URL       : $U
+  Header    : Authorization: Bearer $T
+  JSON      : {"mcpServers":{"obscura-remote":{"type":"http","url":"$U","headers":{"Authorization":"Bearer $T"}}}}
+  stdio-only clients (bridge):
+    npx -y mcp-remote $U --header "Authorization: Bearer $T"
+  Plain HTTP clients must send a non-default User-Agent (Cloudflare blocks Python-urllib).
+
+Revoke later: obscura-gw revoke-token $1
+EOS
+}
+has_agent(){ token_lines | awk -v a="$1" '$2==a{f=1} END{exit !f}'; }
+valid_name(){ [[ "$1" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "agent name: use [A-Za-z0-9_.-]" >&2; exit 1; }; }
+restart(){
+  if in_container; then   # PID 1 is the gateway; compose's restart policy brings it back
+    echo "restarting container (restart: unless-stopped)"; kill -TERM 1; return
+  fi
+  if [ "$(id -u)" = 0 ]; then systemctl restart "$SERVICE"; echo "restarted"; return; fi
+  # the service runs as us with Restart=always: killing it is a restart, no sudo needed
+  pid=$(systemctl show -p MainPID --value "$SERVICE")
+  [ "${pid:-0}" != 0 ] && kill "$pid" 2>/dev/null || { echo "cannot restart $SERVICE as $(id -un); use sudo" >&2; exit 1; }
+  for _ in $(seq 1 40); do sleep 0.25; n=$(systemctl show -p MainPID --value "$SERVICE"); [ "$n" != 0 ] && [ "$n" != "$pid" ] && break; done
+  echo "restarted (pid ${n:-?})"
+}
+cmd=${1:-status}; shift || true
+case "$cmd" in
+  status)
+    in_container || systemctl --no-pager --lines=0 status "$SERVICE" 2>/dev/null | head -4 || true
+    echo "--- health ---"; http_get "http://$(gw_host):$(gw_port)/healthz"
+    echo "--- tokens: $(token_lines | wc -l)   live browsers: $(docker ps -q --filter "label=$(label)=1" | wc -l)";;
+  sessions)
+    docker ps --filter "label=$(label)=1" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}';;
+  logs)
+    if in_container; then echo "inside Docker: run 'docker compose logs -f gateway' on the host"; exit 0; fi
+    if [ "${1:-}" = "-f" ]; then journalctl -u "$SERVICE" -f; else journalctl -u "$SERVICE" --no-pager -n 60; fi;;
+  add-token)
+    ag=${1:?agent name required}; valid_name "$ag"
+    has_agent "$ag" && { echo "agent '$ag' already has a token (revoke-token first to rotate)" >&2; exit 1; }
+    tok=$(newtoken)
+    { token_lines; echo "$tok $ag"; } | write_tokens
+    if [ "${2:-}" = "-q" ]; then echo "$tok"; else echo "created token for '$ag'"; print_setup "$ag" "$tok"; fi;;
+  setup)
+    ag=${1:?name required}
+    has_agent "$ag" || { echo "no such agent '$ag' (see: obscura-gw tokens)" >&2; exit 1; }
+    print_setup "$ag" "$(token_of "$ag")";;
+  revoke-token)
+    ag=${1:?agent name required}
+    has_agent "$ag" || { echo "no such agent '$ag'" >&2; exit 1; }
+    token_lines | awk -v a="$ag" '$2!=a' | write_tokens
+    echo "revoked '$ag' (its sessions close on the next request to the gateway)";;
+  rename-token)
+    old=${1:?old name}; new=${2:?new name}; valid_name "$new"
+    has_agent "$old" || { echo "no such agent '$old'" >&2; exit 1; }
+    has_agent "$new" && { echo "agent '$new' already exists" >&2; exit 1; }
+    token_lines | awk -v o="$old" -v n="$new" '$2==o{$2=n} {print}' | write_tokens
+    echo "renamed '$old' -> '$new'";;
+  tokens)
+    token_lines | awk '{t=$1; print substr(t,1,6)"…"substr(t,length(t)-3) "  -> " $2}';;
+  crashes)
+    d=$(crash_dir)
+    if [ "${1:-}" = "show" ]; then
+      f=${2:-$(ls -1 "$d"/*.log 2>/dev/null | tail -1 || true)}
+      [ -n "$f" ] || { echo "no crash logs in $d"; exit 0; }
+      [ -f "$f" ] || f="$d/$(basename "$f")"
+      cat "$f"; exit 0
+    fi
+    n=${1:-10}; [[ "$n" =~ ^[0-9]+$ ]] || { echo "usage: obscura-gw crashes [N] | crashes show [FILE]" >&2; exit 1; }
+    files=$(ls -1 "$d"/*.log 2>/dev/null | tail -n "$n" || true)
+    [ -n "$files" ] || { echo "no crash logs in $d"; exit 0; }
+    echo "$(ls -1 "$d"/*.log | wc -l) crash log(s) in $d; newest last:"
+    for f in $files; do
+      ec=$(sed -n 's/^exit_code: *//p' "$f"); oom=$(sed -n 's/^oom_killed: *//p' "$f")
+      last=$(awk '/^recent tool calls/{r=1;next} r&&/^  /{l=$0} r&&/^$/{exit} END{print l}' "$f" | sed 's/^ *//')
+      printf '%s  exit=%s oom=%s  last: %s\n' "$(basename "$f")" "$ec" "$oom" "${last:--}"
+    done;;
+  restart) restart;;
+  stop|start)
+    in_container && { echo "inside Docker: use 'docker compose $cmd' on the host"; exit 1; }
+    systemctl "$cmd" "$SERVICE"; echo "$cmd done";;
+  help|-h|--help) usage;;
+  *) usage; exit 1;;
+esac

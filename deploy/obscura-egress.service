@@ -1,0 +1,13 @@
+[Unit]
+Description=Egress firewall for Obscura Gateway browser containers
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh /opt/obscura-gateway/deploy/firewall.sh
+
+[Install]
+WantedBy=multi-user.target

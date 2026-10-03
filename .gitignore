@@ -1,0 +1,10 @@
+# local config and tokens
+config/
+*.env
+!deploy/gateway.env.example
+# runtime
+data/
+crashes/
+__pycache__/
+*.pyc
+*.log

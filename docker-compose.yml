@@ -1,0 +1,58 @@
+# Obscura Gateway with Docker Compose (Linux host).
+#
+#   mkdir -p config && cp deploy/gateway.env.example config/gateway.env
+#   docker compose up -d --build
+#   docker compose exec gateway obscura-gw add-token my-laptop
+#
+# The gateway starts one browser container per session through the host's
+# Docker socket and talks to them on 127.0.0.1, so it uses host networking.
+# Mounting the Docker socket gives this container root-equivalent access to the
+# host: run it only on a machine you control (see docs/security.md).
+name: obscura-gateway
+
+services:
+  gateway:
+    build: .
+    image: obscura-gateway:latest
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./config:/config            # gateway.env: settings + tokens (hot-reloaded)
+      - ./data:/data                # crash logs
+    depends_on:
+      pdftext:
+        condition: service_completed_successfully
+
+  # Builds the sandboxed PDF -> text helper image that the gateway runs per request,
+  # and makes sure the browser network exists. Exits immediately.
+  pdftext:
+    build: ./pdftext
+    image: obscura-gw-pdftext:1
+    entrypoint: ["true"]
+    restart: "no"
+    networks: [browsers]
+
+  # Network-level egress policy for the browser network: public internet only.
+  # Needs NET_ADMIN on the host network namespace; remove this service to skip it.
+  egress-firewall:
+    image: alpine:3.20
+    network_mode: host
+    cap_add: [NET_ADMIN, NET_RAW]
+    restart: unless-stopped
+    environment:
+      OBSCURA_BRIDGE: ${OBSCURA_BRIDGE:-br-obscura}
+    volumes:
+      - ./deploy/firewall.sh:/firewall.sh:ro
+    command: ["sh", "-c", "apk add --no-cache -q iptables && sh /firewall.sh && exec sleep infinity"]
+
+networks:
+  browsers:
+    # must match OBSCURA_GW_NETWORK in config/gateway.env
+    name: ${OBSCURA_NETWORK:-obscura-net}
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: ${OBSCURA_BRIDGE:-br-obscura}
+    ipam:
+      config:
+        - subnet: ${OBSCURA_SUBNET:-172.31.250.0/24}

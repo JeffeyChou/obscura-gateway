@@ -1,0 +1,7 @@
+.git
+config
+data
+crashes
+docs
+tests
+*.md
