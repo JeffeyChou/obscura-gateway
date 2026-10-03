@@ -1,6 +1,6 @@
 [Unit]
 Description=Obscura Gateway (isolated headless browsers over MCP)
-Documentation=https://github.com/obscura-gateway/obscura-gateway
+Documentation=https://github.com/JeffeyChou/obscura-gateway
 After=network-online.target docker.service
 Wants=network-online.target
 Requires=docker.service

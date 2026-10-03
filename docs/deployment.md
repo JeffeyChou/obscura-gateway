@@ -22,7 +22,7 @@ Obscura Gateway runs on one Linux host with Docker. Pick one of two ways to run 
 ## Option A: Docker Compose
 
 ```bash
-git clone https://github.com/<you>/obscura-gateway && cd obscura-gateway
+git clone https://github.com/JeffeyChou/obscura-gateway && cd obscura-gateway
 mkdir -p config && cp deploy/gateway.env.example config/gateway.env
 $EDITOR config/gateway.env          # optional: OBSCURA_GW_PUBLIC_BASE, OBSCURA_GW_HOST, ...
 docker compose up -d --build
@@ -57,7 +57,7 @@ Notes:
 ## Option B: direct install (systemd)
 
 ```bash
-git clone https://github.com/<you>/obscura-gateway && cd obscura-gateway
+git clone https://github.com/JeffeyChou/obscura-gateway && cd obscura-gateway
 sudo ./deploy/install.sh --first-token my-laptop
 ```
 

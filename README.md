@@ -58,7 +58,7 @@ You need a Linux host with Docker.
 ### Option A: Docker Compose
 
 ```bash
-git clone https://github.com/<you>/obscura-gateway && cd obscura-gateway
+git clone https://github.com/JeffeyChou/obscura-gateway && cd obscura-gateway
 mkdir -p config && cp deploy/gateway.env.example config/gateway.env
 docker compose up -d --build
 docker compose exec gateway obscura-gw add-token my-laptop
@@ -67,7 +67,7 @@ docker compose exec gateway obscura-gw add-token my-laptop
 ### Option B: direct install (systemd)
 
 ```bash
-git clone https://github.com/<you>/obscura-gateway && cd obscura-gateway
+git clone https://github.com/JeffeyChou/obscura-gateway && cd obscura-gateway
 sudo ./deploy/install.sh --first-token my-laptop
 ```
 
